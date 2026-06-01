@@ -60,7 +60,7 @@ class NottinghamDataset(Dataset):
         self.pairs: list[tuple[list[int], list[int]]] = []
 
         for seq in sequences:
-            # Need at least seq_len + 1 tokens to form one complete window
+            # Short sequences are retained and padded to one complete window.
             if len(seq) < 2:
                 continue
             for start in range(0, max(1, len(seq) - 1), stride):
@@ -91,7 +91,7 @@ class NottinghamDataset(Dataset):
 
 class LSTMLanguageModel(nn.Module):
     """
-    Character-level LSTM language model for (pitch, duration) token sequences.
+    Token-level LSTM language model for (pitch, duration) sequences.
 
     Architecture:
         Embedding(vocab_size, embed_dim)

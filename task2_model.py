@@ -13,10 +13,10 @@ Components:
   HarmonizationDataset      — encode windows into tensors
   BahdanauAttention         — additive attention for decoder
   Encoder                   — Bidirectional LSTM over melody tokens
-  Decoder                   — LSTM with two output heads (label + duration)
-  Seq2SeqHarmonizer         — wraps Encoder + Decoder with teacher forcing
+  Decoder                   — attention-conditioned LSTM with two output heads
+  Seq2SeqHarmonizer         — wraps Encoder + one-step attention decoder
   train_epoch_t2 / evaluate_t2 / train_model_t2
-  harmonize                 — greedy autoregressive chord generation
+  harmonize                 — greedy chord prediction for melody windows
   harmonization_to_midi     — render melody + predicted chords to .mid
 """
 
@@ -48,6 +48,7 @@ CHORD_INTERVALS = {
 
 # MIDI pitch for each root at octave 4 (C4 = 60)
 ROOT_TO_PITCH = {r: 60 + i for i, r in enumerate(ROOTS)}
+ROOT_TO_PITCH.update({'Db': 61, 'Eb': 63, 'Gb': 66, 'Ab': 68, 'Bb': 70})
 
 SEED = 42
 
@@ -58,11 +59,11 @@ SEED = 42
 
 def build_chord_label_vocab(windows):
     """
-    Build a (root, quality) → int mapping from the full window list.
+    Build a (root, quality) → int mapping from the provided training windows.
     Duration is handled separately (directly as bin index 0-5).
     Returns chord_label_vocab, id2chord_label.
     """
-    pairs = sorted({(root, qual) for _, root, qual, _ in windows})
+    pairs = sorted({(root, qual) for _, root, qual, *_ in windows})
     vocab = {pair: i for i, pair in enumerate(pairs)}
     id2vocab = {i: pair for pair, i in vocab.items()}
     return vocab, id2vocab
@@ -90,7 +91,7 @@ class HarmonizationDataset(Dataset):
         self.samples = []
         pad_id = melody_vocab.get('<PAD>', 0)
 
-        for melody_window, root, quality, dur_bin in windows:
+        for melody_window, root, quality, dur_bin, *_ in windows:
             melody_ids = [melody_vocab.get(tok, pad_id) for tok in melody_window]
             label_id   = chord_label_vocab.get((root, quality))
             if label_id is None:
@@ -124,8 +125,8 @@ class BahdanauAttention(nn.Module):
     A fixed vector (last encoder hidden state) compresses the entire melody
     into a single vector — information about individual notes is lost.
     Attention lets the decoder query which melody notes are most relevant
-    at each chord prediction step, mimicking how a human harmonizer focuses
-    on different melody fragments for each chord decision.
+    for each window-level chord prediction instead of relying only on a
+    single pooled encoder vector.
     """
 
     def __init__(self, encoder_hidden_dim: int, decoder_hidden_dim: int):
@@ -177,6 +178,7 @@ class Encoder(nn.Module):
         melody_vocab_size: int,
         embed_dim:  int = 64,
         hidden_dim: int = 128,
+        decoder_hidden_dim: int = 256,
         num_layers: int = 2,
         dropout:    float = 0.3,
     ):
@@ -195,9 +197,9 @@ class Encoder(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-        # Project concatenated bidirectional final state → decoder init dim (256)
-        self.fc_h = nn.Linear(hidden_dim * 2, 256)
-        self.fc_c = nn.Linear(hidden_dim * 2, 256)
+        # Project concatenated bidirectional final state to decoder init size.
+        self.fc_h = nn.Linear(hidden_dim * 2, decoder_hidden_dim)
+        self.fc_c = nn.Linear(hidden_dim * 2, decoder_hidden_dim)
 
     def forward(self, melody_ids):
         """
@@ -206,7 +208,7 @@ class Encoder(nn.Module):
 
         Returns:
             encoder_outputs : (batch, window_size, hidden_dim*2)
-            (h_dec_init, c_dec_init) : each (1, batch, 256) — decoder init state
+            (h_dec_init, c_dec_init) : each (1, batch, decoder_hidden_dim)
         """
         emb = self.dropout(self.embedding(melody_ids))    # (B, T, E)
         enc_out, (h_n, c_n) = self.lstm(emb)             # enc_out: (B, T, 2H)
@@ -230,9 +232,9 @@ class Encoder(nn.Module):
 
 class Decoder(nn.Module):
     """
-    Single-step autoregressive decoder with Bahdanau attention and two output heads.
+    Single-step attention decoder with two output heads.
 
-    Input at each step: [previous chord label embedding ‖ attention context]
+    Input: [learned query embedding ‖ attention context]
     Hidden state: 1-layer LSTM with 256 units
 
     Two output heads — separating chord label from duration has two advantages:
@@ -251,7 +253,10 @@ class Decoder(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
 
-        self.embedding = nn.Embedding(chord_label_vocab_size, embed_dim)
+        # The extra embedding is a dedicated query token. It is not a chord
+        # class and is therefore excluded from the output head.
+        self.start_id   = chord_label_vocab_size
+        self.embedding = nn.Embedding(chord_label_vocab_size + 1, embed_dim)
         self.attention  = BahdanauAttention(encoder_hidden_dim, hidden_dim)
 
         # LSTM input = chord embedding + attention context
@@ -273,7 +278,7 @@ class Decoder(nn.Module):
         One decoder step.
 
         Args:
-            prev_chord_id    : (batch,)          — previous predicted chord label id
+            prev_chord_id    : (batch,)          — learned decoder query token id
             decoder_hidden   : tuple (h, c) each (1, batch, 256)
             encoder_outputs  : (batch, src_len, enc_dim)
 
@@ -305,15 +310,9 @@ class Seq2SeqHarmonizer(nn.Module):
     """
     Wires Encoder → Decoder for one melody window → one chord prediction.
 
-    For Task 2 each melody window maps to exactly ONE chord (the majority chord
-    during that window). So the decoder runs for a single step per window —
-    this collapses the seq2seq into a structured attention-based classifier that
-    still inherits the sequential chord-transition modeling at the window level.
-
-    Teacher forcing: during training, feed the ground-truth chord label as the
-    previous token with probability `teacher_forcing_ratio`. Decay this linearly
-    to 0 by epoch 15 so the model learns to rely on its own predictions at
-    inference time.
+    Each melody window maps to exactly ONE majority-overlap chord. The decoder
+    therefore runs for a single step and acts as an attention-conditioned
+    classifier. It does not claim to model chord-to-chord transitions.
     """
 
     def __init__(self, encoder: Encoder, decoder: Decoder):
@@ -321,13 +320,10 @@ class Seq2SeqHarmonizer(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
 
-    def forward(self, melody_ids, target_label_ids=None, teacher_forcing_ratio=0.5):
+    def forward(self, melody_ids):
         """
         Args:
             melody_ids           : (batch, window_size)
-            target_label_ids     : (batch,) ground-truth chord label ids, or None
-            teacher_forcing_ratio: float in [0, 1]
-
         Returns:
             label_logits : (batch, chord_label_vocab_size)
             dur_logits   : (batch, 6)
@@ -335,15 +331,13 @@ class Seq2SeqHarmonizer(nn.Module):
         enc_out, dec_hidden = self.encoder(melody_ids)
 
         batch_size = melody_ids.size(0)
-        # <START> is index 0 in the chord label space as a neutral seed
-        prev_chord = torch.zeros(batch_size, dtype=torch.long,
-                                 device=melody_ids.device)
-
-        # Teacher forcing: occasionally replace prev_chord with ground truth
-        if target_label_ids is not None and random.random() < teacher_forcing_ratio:
-            prev_chord = target_label_ids
-
-        label_logits, dur_logits, _ = self.decoder(prev_chord, dec_hidden, enc_out)
+        query = torch.full(
+            (batch_size,),
+            self.decoder.start_id,
+            dtype=torch.long,
+            device=melody_ids.device,
+        )
+        label_logits, dur_logits, _ = self.decoder(query, dec_hidden, enc_out)
         return label_logits, dur_logits
 
 
@@ -352,7 +346,7 @@ class Seq2SeqHarmonizer(nn.Module):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 def train_epoch_t2(model, loader, optimizer, criterion_label, criterion_dur,
-                   device, tf_ratio: float, clip: float = 1.0):
+                   device, clip: float = 1.0):
     """
     One training epoch.
     Total loss = L_label + 0.5 * L_duration
@@ -369,7 +363,7 @@ def train_epoch_t2(model, loader, optimizer, criterion_label, criterion_dur,
         chord_durs   = chord_durs.to(device)
 
         optimizer.zero_grad()
-        label_logits, dur_logits = model(melody_ids, chord_labels, tf_ratio)
+        label_logits, dur_logits = model(melody_ids)
 
         loss = (criterion_label(label_logits, chord_labels) +
                 0.5 * criterion_dur(dur_logits, chord_durs))
@@ -399,7 +393,7 @@ def evaluate_t2(model, loader, criterion_label, criterion_dur, device):
         chord_labels = chord_labels.to(device)
         chord_durs   = chord_durs.to(device)
 
-        label_logits, dur_logits = model(melody_ids, teacher_forcing_ratio=0.0)
+        label_logits, dur_logits = model(melody_ids)
         loss = (criterion_label(label_logits, chord_labels) +
                 0.5 * criterion_dur(dur_logits, chord_durs))
 
@@ -425,13 +419,11 @@ def train_model_t2(
     weight_decay:     float = 1e-5,
     max_epochs:       int   = 25,
     patience:         int   = 5,
-    tf_decay_epochs:  int   = 15,
     checkpoint_path:  str   = 'task2_best_model.pt',
 ):
     """
     Full training loop with:
       - Adam(lr=5e-4, weight_decay=1e-5)
-      - Teacher forcing linearly decayed from 0.5 → 0.0 over tf_decay_epochs
       - Early stopping on validation chord label accuracy (patience=5)
       - Best model saved to checkpoint_path
 
@@ -453,17 +445,16 @@ def train_model_t2(
     no_improve    = 0
 
     for epoch in range(1, max_epochs + 1):
-        tf_ratio = max(0.0, 0.5 - (epoch - 1) * (0.5 / tf_decay_epochs))
         tr_loss, tr_acc = train_epoch_t2(model, train_loader, optimizer,
                                          criterion_label, criterion_dur,
-                                         device, tf_ratio)
+                                         device)
         vl_loss, vl_acc, vl_dur_acc = evaluate_t2(model, val_loader,
                                                    criterion_label, criterion_dur,
                                                    device)
         train_losses.append(tr_loss);  val_losses.append(vl_loss)
         train_accs.append(tr_acc);     val_accs.append(vl_acc)
 
-        print(f"Epoch {epoch:02d} | TF={tf_ratio:.2f} | "
+        print(f"Epoch {epoch:02d} | "
               f"Train loss: {tr_loss:.4f} acc: {tr_acc:.3f} | "
               f"Val loss: {vl_loss:.4f} acc: {vl_acc:.3f} dur_acc: {vl_dur_acc:.3f}")
 
@@ -487,7 +478,7 @@ def train_model_t2(
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 @torch.no_grad()
-def harmonize(model, melody_windows_encoded, id2chord_label, device):
+def harmonize(model, melody_windows_encoded, id2chord_label, device, window_spans=None):
     """
     Greedy chord prediction for a sequence of encoded melody windows.
 
@@ -498,19 +489,23 @@ def harmonize(model, melody_windows_encoded, id2chord_label, device):
         device
 
     Returns:
-        list of (root, quality, dur_bin) tuples, one per window
+        list of (root, quality, dur_bin) tuples, one per window. When
+        window_spans is provided, each tuple also includes start_sec, end_sec.
     """
     model.eval()
     predictions = []
 
-    for mel_ids in melody_windows_encoded:
+    for i, mel_ids in enumerate(melody_windows_encoded):
         mel_ids_batch = mel_ids.unsqueeze(0).to(device)       # (1, window_size)
-        label_logits, dur_logits = model(mel_ids_batch, teacher_forcing_ratio=0.0)
+        label_logits, dur_logits = model(mel_ids_batch)
 
         pred_label = label_logits.argmax(-1).item()
         pred_dur   = dur_logits.argmax(-1).item()
         root, quality = id2chord_label.get(pred_label, ('C', 'major'))
-        predictions.append((root, quality, pred_dur))
+        prediction = (root, quality, pred_dur)
+        if window_spans is not None:
+            prediction += tuple(window_spans[i])
+        predictions.append(prediction)
 
     return predictions
 
@@ -538,22 +533,22 @@ def harmonization_to_midi(
 
     Args:
         melody_notes     : list of note dicts from extract_melody_tokens()
-                           each has keys: pitch, dur_bin, start_beat, end_beat
-        predicted_chords : list of (root, quality, dur_bin) from harmonize()
+                           each has keys: pitch, dur_bin, start_sec, end_sec
+        predicted_chords : list of either (root, quality, dur_bin) or
+                           (root, quality, dur_bin, start_sec, end_sec)
         output_path      : .mid filename
         tempo            : BPM
 
     Returns:
         output_path (str)
     """
-    bps = tempo / 60.0
     pm  = pretty_midi.PrettyMIDI(initial_tempo=tempo)
 
     # ── Track 0: melody ──────────────────────────────────────────────────────
     melody_inst = pretty_midi.Instrument(program=melody_program, name='melody')
     for nd in melody_notes:
-        start_sec = nd['start_beat'] / bps
-        end_sec   = nd['end_beat']   / bps
+        start_sec = nd['start_sec']
+        end_sec   = nd['end_sec']
         note = pretty_midi.Note(
             velocity=melody_velocity,
             pitch=int(nd['pitch']),
@@ -566,15 +561,20 @@ def harmonization_to_midi(
     # ── Track 1: chords ───────────────────────────────────────────────────────
     chord_inst = pretty_midi.Instrument(program=chord_program, name='chords')
     if melody_notes and predicted_chords:
-        # Distribute chords evenly over the total melody duration
-        total_melody_beats = melody_notes[-1]['end_beat']
-        beats_per_chord    = total_melody_beats / max(len(predicted_chords), 1)
-
-        for i, (root, quality, dur_bin) in enumerate(predicted_chords):
-            start_beat = i * beats_per_chord
-            end_beat   = start_beat + DURATION_BINS_BEATS[dur_bin]
-            start_sec  = start_beat / bps
-            end_sec    = end_beat   / bps
+        bps = tempo / 60.0
+        cursor_sec = melody_notes[0]['start_sec']
+        for chord in predicted_chords:
+            root, quality, dur_bin = chord[:3]
+            if len(chord) >= 5:
+                start_sec, window_end_sec = chord[3], chord[4]
+                end_sec = min(
+                    start_sec + DURATION_BINS_BEATS[dur_bin] / bps,
+                    window_end_sec,
+                )
+            else:
+                start_sec = cursor_sec
+                end_sec = start_sec + DURATION_BINS_BEATS[dur_bin] / bps
+                cursor_sec = end_sec
 
             root_pitch = ROOT_TO_PITCH.get(root, 60) - 12  # one octave down
             intervals  = CHORD_INTERVALS.get(quality, [0, 4, 7])
